@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -14,6 +15,17 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#elif defined(__unix__) || defined(__APPLE__)
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 struct alignas(64) ProducerStats {
@@ -21,6 +33,65 @@ struct alignas(64) ProducerStats {
     std::uint64_t maxSubmitLatencyNs{};
     long double totalSubmitLatencyNs{};
 };
+
+struct LatencySummary {
+    std::uint64_t minNs{};
+    std::uint64_t p50Ns{};
+    std::uint64_t p95Ns{};
+    std::uint64_t p99Ns{};
+    std::uint64_t maxNs{};
+    double averageNs{};
+};
+
+std::uint64_t currentResidentMemoryBytes() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters))) {
+        return static_cast<std::uint64_t>(counters.WorkingSetSize);
+    }
+#elif defined(__unix__) || defined(__APPLE__)
+    struct rusage usage {};
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+#if defined(__APPLE__)
+        return static_cast<std::uint64_t>(usage.ru_maxrss);
+#else
+        return static_cast<std::uint64_t>(usage.ru_maxrss) * 1024ULL;
+#endif
+    }
+#endif
+    return 0;
+}
+
+double bytesToMiB(std::uint64_t bytes) {
+    return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+LatencySummary summarizeLatencies(std::vector<std::uint64_t> samples) {
+    if (samples.empty()) {
+        return {};
+    }
+
+    std::sort(samples.begin(), samples.end());
+    const auto percentile = [&](double p) {
+        const auto index = static_cast<std::size_t>((samples.size() - 1) * p);
+        return samples[index];
+    };
+
+    long double total = 0.0;
+    for (const auto sample : samples) {
+        total += sample;
+    }
+
+    return LatencySummary{
+        samples.front(),
+        percentile(0.50),
+        percentile(0.95),
+        percentile(0.99),
+        samples.back(),
+        static_cast<double>(total / samples.size())
+    };
+}
 
 std::uint64_t parseArg(int argc, char** argv, int index, std::uint64_t fallback) {
     if (argc <= index) {
@@ -394,7 +465,14 @@ int main(int argc, char** argv) {
     const std::uint64_t readerCount = parseArg(argc, argv, 3, 4);
     const std::uint64_t perProducer = (totalOrders + producerCount - 1) / producerCount;
 
-    MatchingEngine engine(static_cast<std::size_t>(std::min<std::uint64_t>(totalOrders, 5'000'000ULL)), 10, 65'536);
+    const auto memoryBeforeBytes = currentResidentMemoryBytes();
+    const auto cpuStart = std::clock();
+
+    MatchingEngine engine(
+        static_cast<std::size_t>(std::min<std::uint64_t>(totalOrders, 5'000'000ULL)),
+        10,
+        65'536,
+        static_cast<std::size_t>(totalOrders));
     engine.start();
 
     std::atomic<bool> readersRunning{true};
@@ -442,6 +520,10 @@ int main(int argc, char** argv) {
 
     const auto finish = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(finish - start).count();
+    const auto cpuFinish = std::clock();
+    const double cpuSeconds = static_cast<double>(cpuFinish - cpuStart) / CLOCKS_PER_SEC;
+    const auto memoryAfterBytes = currentResidentMemoryBytes();
+    const auto memoryDeltaBytes = memoryAfterBytes > memoryBeforeBytes ? memoryAfterBytes - memoryBeforeBytes : 0;
 
     std::uint64_t sent = 0;
     std::uint64_t maxLatency = 0;
@@ -454,11 +536,30 @@ int main(int argc, char** argv) {
 
     const auto& stats = engine.stats();
     auto snapshot = engine.snapshot();
+    const auto latencySummary = summarizeLatencies(engine.processLatenciesNs());
+    const auto hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
+    const double processCpuPercent = seconds > 0.0 ? (cpuSeconds / seconds) * 100.0 : 0.0;
+    const double normalizedCpuPercent = processCpuPercent / hardwareThreads;
 
     std::cout << "Processed events: " << stats.processed.load(std::memory_order_relaxed) << "\n";
     std::cout << "Submitted events: " << sent << "\n";
     std::cout << "Throughput: " << std::fixed << std::setprecision(2) << (sent / seconds) << " orders/sec\n";
     std::cout << "Elapsed: " << seconds << " sec\n";
+    std::cout << "CPU time: " << cpuSeconds << " sec\n";
+    std::cout << "CPU usage: " << processCpuPercent << "% process, "
+              << normalizedCpuPercent << "% normalized over " << hardwareThreads << " hardware threads\n";
+    std::cout << "Memory RSS: " << std::setprecision(2) << bytesToMiB(memoryAfterBytes) << " MiB"
+              << " (" << bytesToMiB(memoryDeltaBytes) << " MiB delta during run)\n";
+    std::cout << "Event mix: "
+              << stats.added.load(std::memory_order_relaxed) << " limit adds, "
+              << stats.marketOrders.load(std::memory_order_relaxed) << " market orders, "
+              << stats.modified.load(std::memory_order_relaxed) << " modifies, "
+              << stats.canceled.load(std::memory_order_relaxed) << " successful cancels\n";
+    std::cout << "Matching latency avg: " << latencySummary.averageNs << " ns\n";
+    std::cout << "Matching latency p50: " << latencySummary.p50Ns << " ns\n";
+    std::cout << "Matching latency p95: " << latencySummary.p95Ns << " ns\n";
+    std::cout << "Matching latency p99: " << latencySummary.p99Ns << " ns\n";
+    std::cout << "Matching latency max: " << latencySummary.maxNs << " ns\n";
     std::cout << "Average submit latency: " << std::setprecision(2) << (sent == 0 ? 0.0 : static_cast<double>(totalLatency / sent)) << " ns\n";
     std::cout << "Max submit latency: " << maxLatency << " ns\n";
     std::cout << "Filled quantity: " << stats.filledQuantity.load(std::memory_order_relaxed) << "\n";

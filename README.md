@@ -26,7 +26,7 @@ g++ -O3 -march=native -pthread -std=c++20 main.cpp -o orderbook_bench
 On Windows PowerShell with MinGW:
 
 ```powershell
-g++ -O3 -march=native -pthread -std=c++20 main.cpp -o orderbook_bench
+g++ -O3 -march=native -pthread -std=c++20 main.cpp -o orderbook_bench -lpsapi
 ```
 
 ## Run the Benchmark
@@ -55,7 +55,35 @@ Example:
 ./orderbook_bench 1000000 8 4
 ```
 
-The benchmark prints processed event count, throughput, submit latency, filled quantity, snapshot reads, live order counts, and an invariant check.
+The benchmark prints processed event count, throughput, matching latency percentiles, submit latency, CPU usage, memory RSS, filled quantity, snapshot reads, live order counts, and an invariant check.
+
+Example local run on a 12-thread Windows machine:
+
+```text
+> .\orderbook_bench.exe 3000000 8 4
+Processed events: 3000000
+Submitted events: 3000000
+Throughput: 1332256.87 orders/sec
+Elapsed: 2.25 sec
+CPU time: 2.26 sec
+CPU usage: 100.54% process, 8.38% normalized over 12 hardware threads
+Memory RSS: 139.17 MiB (130.70 MiB delta during run)
+Event mix: 2039183 limit adds, 209846 market orders, 390624 modifies, 18221 successful cancels
+Matching latency avg: 567.32 ns
+Matching latency p50: 400 ns
+Matching latency p95: 1200 ns
+Matching latency p99: 2100 ns
+Matching latency max: 20767400 ns
+Average submit latency: 2331.25 ns
+Max submit latency: 6494700 ns
+Filled quantity: 485980632
+Live orders: 289543
+Snapshots published: 47
+Snapshot reads: 10755996
+Book invariant check: PASS
+```
+
+The latency numbers above measure time spent by the single matching thread processing an event after it leaves the producer queue. Submit latency measures producer-side enqueue time under concurrent load.
 
 ## Interactive Mode
 
@@ -180,4 +208,3 @@ or, in interactive mode:
 ```text
 Final invariant check: PASS
 ```
-
